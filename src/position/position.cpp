@@ -521,11 +521,11 @@ namespace stormphrax {
             return true;
         }
 
-        // KBKB OCB
+        // KBKB with same-colored bishops
         if ((bbs.blackNonPk() == bbs.blackBishops() && bbs.whiteNonPk() == bbs.whiteBishops())
             && !bbs.blackBishops().multiple() && !bbs.whiteBishops().multiple()
             && (bbs.blackBishops() & boards::kLightSquares).empty()
-                   != (bbs.whiteBishops() & boards::kLightSquares).empty())
+                   == (bbs.whiteBishops() & boards::kLightSquares).empty())
         {
             return true;
         }
