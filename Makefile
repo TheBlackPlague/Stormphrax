@@ -19,7 +19,6 @@ endif
 
 ifndef EVALFILE
     EVALFILE = $(DEFAULT_NET).nnue
-    NO_EVALFILE_SET = true
 endif
 
 COMMIT_HASH = off
@@ -118,14 +117,6 @@ all: native release
 .PHONY: all
 
 .DEFAULT_GOAL := native
-
-ifdef NO_EVALFILE_SET
-$(EVALFILE):
-	$(info Downloading default network $(DEFAULT_NET).nnue)
-	curl -sOL https://github.com/Ciekce/stormphrax-nets/releases/download/$(DEFAULT_NET)/$(DEFAULT_NET).nnue
-
-download-net: $(EVALFILE)
-endif
 
 tmp:
 	mkdir tmp
