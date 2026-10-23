@@ -114,9 +114,8 @@ namespace stormphrax::search {
             );
         }
 
-        m_resetBarrier.arriveAndWait();
-
-        m_infinite = infinite;
+        SP_UNUSED(infinite);
+        m_infinite = false;
 
         m_minRootScore = -kScoreInf;
         m_maxRootScore = kScoreInf;
@@ -132,12 +131,15 @@ namespace stormphrax::search {
             m_rootStatus = initRootMoveList(pos);
 
             if (m_rootStatus == RootStatus::kNoLegalMoves) {
-                println("info string no legal moves");
+                println("info depth 0 nodes 0 score {}", pos.isCheck() ? "mate 0" : "cp 0");
+                println("bestmove 0000");
                 return;
             }
         }
 
         assert(!m_rootMoveList.empty());
+
+        m_resetBarrier.arriveAndWait();
 
         m_multiPv = std::min<u32>(g_opts.multiPv, m_rootMoveList.size());
 
@@ -252,6 +254,8 @@ namespace stormphrax::search {
     }
 
     void Searcher::setThreads(u32 threadCount) {
+        threadCount = 1;
+
         if (threadCount == m_threads.size()) {
             return;
         }
@@ -286,37 +290,7 @@ namespace stormphrax::search {
     RootStatus Searcher::initRootMoveList(const Position& pos) {
         m_rootMoveList.clear();
 
-        if (g_opts.syzygyEnabled
-            && pos.bbs().occupancy().popcount() <= std::min(g_opts.syzygyProbeLimit, static_cast<i32>(TB_LARGEST)))
-        {
-            bool success = true;
-
-            m_rootProbeResult = tb::probeRoot(&m_rootMoveList, pos);
-
-            switch (m_rootProbeResult) {
-                case tb::ProbeResult::kWin:
-                    m_minRootScore = kScoreTbWin;
-                    break;
-                case tb::ProbeResult::kDraw:
-                    m_minRootScore = m_maxRootScore = 0;
-                    break;
-                case tb::ProbeResult::kLoss:
-                    m_maxRootScore = -kScoreTbWin;
-                    break;
-                default:
-                    success = false;
-                    break;
-            }
-
-            if (success) {
-                assert(!m_rootMoveList.empty());
-                return RootStatus::kTablebase;
-            }
-        }
-
-        if (m_rootMoveList.empty()) {
-            generateLegal(m_rootMoveList, pos);
-        }
+        generateLegal(m_rootMoveList, pos);
 
         return m_rootMoveList.empty() ? RootStatus::kNoLegalMoves : RootStatus::kGenerated;
     }
@@ -390,115 +364,36 @@ namespace stormphrax::search {
 
         auto& searchData = thread.search;
 
-        PvList rootPv{};
-
         searchData.nodes = 0;
-        thread.stack[0].killers.clear();
+        searchData.rootDepth = 1;
+        searchData.seldepth = 1;
 
-        thread.optimism = {};
+        thread.pvIdx = 0;
+        thread.depthCompleted = 1;
 
-        thread.depthCompleted = 0;
+        for (auto& rootMove : thread.rootMoves) {
+            const auto [child, guard] = thread.applyMove(thread.rootPos, 0, rootMove.pv.moves[0]);
+            searchData.incNodes();
 
-        for (i32 depth = 1;; ++depth) {
-            searchData.rootDepth = depth;
+            MoveList replies{};
+            generateLegal(replies, child);
 
-            for (auto& move : thread.rootMoves) {
-                move.previousScore = move.score;
+            Score score;
+            if (replies.empty()) {
+                score = child.isCheck() ? kScoreMate - 1 : 0;
+            } else if (child.isDrawn(1, thread.keyHistory)) {
+                score = 0;
+            } else {
+                score = -eval::staticEval(child, thread.nnueState);
             }
 
-            for (thread.pvIdx = 0; thread.pvIdx < m_multiPv; ++thread.pvIdx) {
-                searchData.seldepth = 0;
-
-                const auto& rootMove = thread.rootMoves[thread.pvIdx];
-
-                if (depth > 1) {
-                    const auto optimism =
-                        optimismScale() * rootMove.averageScore / (std::abs(rootMove.averageScore) + optimismStretch());
-                    thread.optimism[thread.rootPos.stm().idx()] = optimism;
-                    thread.optimism[thread.rootPos.nstm().idx()] = -optimism;
-                }
-
-                auto delta = initialAspWindow();
-
-                auto alpha = -kScoreInf;
-                auto beta = kScoreInf;
-
-                if (depth >= 3) {
-                    const auto lastScore = rootMove.windowScore;
-
-                    alpha = std::max(lastScore - delta, -kScoreInf);
-                    beta = std::min(lastScore + delta, kScoreInf);
-                }
-
-                i32 aspReduction = 0;
-
-                while (!hasStopped()) {
-                    // count the root node
-                    searchData.incNodes();
-
-                    const auto aspDepth = std::max(depth - aspReduction, 1); // paranoia
-                    const auto score =
-                        search<true, true>(thread, thread.rootPos, rootPv, aspDepth, 0, 0, alpha, beta, false);
-
-                    thread.sortRemainingRootMoves();
-
-                    if ((score > alpha && score < beta) || hasStopped()) {
-                        break;
-                    }
-
-                    if (thread.isMainThread() && !m_silent && !g_opts.minimal && g_opts.multiPv == 1) {
-                        const auto time = elapsed();
-                        if (time >= kWidenReportDelay) {
-                            reportSingle(thread, thread.pvIdx, depth, time);
-                        }
-                    }
-
-                    if (score <= alpha) {
-                        aspReduction = 0;
-
-                        beta = (alpha + beta) / 2;
-                        alpha = std::max(score - delta, -kScoreInf);
-                    } else {
-                        aspReduction = std::min(aspReduction + 1, 3);
-                        beta = std::min(score + delta, kScoreInf);
-                    }
-
-                    delta += delta * aspWideningFactor() / 16;
-                }
-
-                thread.sortSearchedRootMoves();
-
-                assert(thread.pvMove().pv.length > 0);
-
-                if (thread.isMainThread()) {
-                    const bool lastPv = thread.pvIdx + 1 == m_multiPv;
-
-                    if (lastPv && !hasStopped()) {
-                        const auto nodes = searchData.loadNodes();
-                        m_limiter->update(depth, nodes, thread.pvMove());
-                        if (depth >= m_maxDepth || m_limiter->stopSoft(nodes)) {
-                            m_stop.store(true, std::memory_order::relaxed);
-                        }
-                    }
-
-                    if (!m_silent
-                        && (hasStopped() || (!g_opts.minimal && (lastPv || elapsed() >= kMultipvVerboseDelay))))
-                    {
-                        report(thread, searchData.rootDepth, elapsed());
-                    }
-                }
-
-                if (hasStopped()) {
-                    break;
-                }
-            }
-
-            if (hasStopped()) {
-                break;
-            }
-
-            thread.depthCompleted = depth;
+            rootMove.score = rootMove.displayScore = score;
+            rootMove.seldepth = 1;
+            rootMove.nodes = 1;
         }
+
+        thread.sortRemainingRootMoves();
+        report(thread, 1, elapsed());
 
         const auto waitForThreads = [&] {
             {
